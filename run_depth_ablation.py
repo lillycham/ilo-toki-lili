@@ -18,6 +18,11 @@ from pathlib import Path
 
 import torch
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None  # type: ignore[assignment,misc]
+
 from arch import TokiLlama, TokiLlamaConfig
 from data import DATASETS, _extract_texts
 from tokenizer import TokiPonaTokenizer
@@ -176,9 +181,15 @@ def run_arm(
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics: dict[str, list] = {"train": [], "val_all": [], "val_long": []}
 
+    writer = None
+    if SummaryWriter is not None and not args.no_tb:
+        tb_dir = (args.tb_dir or (args.out_root / "tb")) / arm_name
+        writer = SummaryWriter(log_dir=str(tb_dir))
+
     print(
         f"\n=== [{arm_name}] unique={n_unique} loops={n_loops} eff={n_unique*n_loops} "
-        f"depth_attn={use_da} | params={total_params:,} ({total_params - embed_params:,} non-emb) ==="
+        f"depth_attn={use_da} | params={total_params:,} ({total_params - embed_params:,} non-emb) ===",
+        flush=True,
     )
 
     train_time = 0.0
@@ -209,9 +220,14 @@ def run_arm(
             tok_s = (step * args.batch_size * args.seq_len) / max(train_time, 1e-6)
             lr_now = scheduler.get_last_lr()[0]
             metrics["train"].append([step, round(avg_loss, 4), lr_now])
+            if writer is not None:
+                writer.add_scalar("train/loss", avg_loss, step)
+                writer.add_scalar("train/lr", lr_now, step)
+                writer.add_scalar("perf/tok_per_sec", tok_s, step)
             print(
                 f"  step {step:4d}/{args.steps} | tr {avg_loss:.3f} | "
-                f"lr {lr_now:.2e} | {tok_s:,.0f} tok/s"
+                f"lr {lr_now:.2e} | {tok_s:,.0f} tok/s",
+                flush=True,
             )
 
         in_decay = step > decay_start
@@ -225,6 +241,12 @@ def run_arm(
             v_long = evaluate_deterministic(raw_model, val_long, args.batch_size, args.seq_len, device)
             metrics["val_all"].append([step, round(v_all, 4)])
             metrics["val_long"].append([step, round(v_long, 4)])
+            if writer is not None:
+                writer.add_scalar("val/all_loss", v_all, step)
+                writer.add_scalar("val/all_ppl", math.exp(v_all), step)
+                writer.add_scalar("val/long_loss", v_long, step)
+                writer.add_scalar("val/long_ppl", math.exp(v_long), step)
+                writer.flush()
             tag = ""
             if v_all < best_val:
                 best_val = v_all
@@ -234,9 +256,12 @@ def run_arm(
                 tag = " [best]"
             print(
                 f"  -> eval @{step}: val_all={v_all:.3f} (ppl {math.exp(v_all):.2f}) | "
-                f"val_long={v_long:.3f} (ppl {math.exp(v_long):.2f}){tag}"
+                f"val_long={v_long:.3f} (ppl {math.exp(v_long):.2f}){tag}",
+                flush=True,
             )
 
+    if writer is not None:
+        writer.close()
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     return {
         "arm": arm_name,
@@ -271,6 +296,8 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default=None)
     p.add_argument("--out-root", type=Path, default=Path("checkpoints/depth-ablation"))
+    p.add_argument("--tb-dir", type=Path, default=None, help="TensorBoard log dir (default: <out-root>/tb)")
+    p.add_argument("--no-tb", action="store_true", help="Disable TensorBoard logging")
     args = p.parse_args()
 
     device = pick_device(args.device)
