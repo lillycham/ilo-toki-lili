@@ -10,8 +10,9 @@ import time
 from pathlib import Path
 
 import torch
-from transformers import LlamaForCausalLM
+import torch.nn as nn
 
+from arch import compute_loss, generate_tokens, load_causal_lm
 from tokenizer import TokiPonaTokenizer
 from train import pick_device
 
@@ -92,7 +93,7 @@ def make_batch(
 
 @torch.no_grad()
 def evaluate(
-    model: LlamaForCausalLM,
+    model: nn.Module,
     val_examples: list[tuple[list[int], list[int]]],
     batch_size: int,
     pad_id: int,
@@ -103,15 +104,15 @@ def evaluate(
     for i in range(0, len(val_examples), batch_size):
         batch = val_examples[i : i + batch_size]
         x, y, mask = make_batch(batch, pad_id, device)
-        out = model(input_ids=x, attention_mask=mask, labels=y)
-        losses.append(out.loss.item())
+        loss = compute_loss(model, x, mask, y)
+        losses.append(loss.item())
     model.train()
     return sum(losses) / max(1, len(losses))
 
 
 @torch.no_grad()
 def reply_once(
-    model: LlamaForCausalLM,
+    model: nn.Module,
     tokenizer: TokiPonaTokenizer,
     user_msg: str,
     device: torch.device,
@@ -125,10 +126,10 @@ def reply_once(
     )
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     nl_id = tokenizer.tok2id["\n"]
-    out = model.generate(
+    out = generate_tokens(
+        model=model,
         input_ids=input_ids,
         max_new_tokens=max_new_tokens,
-        do_sample=True,
         temperature=temperature,
         top_p=0.9,
         pad_token_id=tokenizer.pad_token_id,
@@ -175,7 +176,7 @@ def main() -> None:
     val_ex = examples[split:]
     print(f"Loaded {len(train_ex):,} train and {len(val_ex):,} val dialogues")
 
-    model = LlamaForCausalLM.from_pretrained(args.base).to(device)
+    model = load_causal_lm(args.base, device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.05
     )
@@ -206,8 +207,7 @@ def main() -> None:
         for i in range(0, len(train_ex), args.batch_size):
             batch = train_ex[i : i + args.batch_size]
             x, y, mask = make_batch(batch, tokenizer.pad_token_id, device)
-            out = model(input_ids=x, attention_mask=mask, labels=y)
-            loss = out.loss
+            loss = compute_loss(model, x, mask, y)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()

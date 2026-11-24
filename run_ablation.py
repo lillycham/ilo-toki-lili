@@ -15,9 +15,10 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from huggingface_hub import hf_hub_download
-from transformers import LlamaForCausalLM
 
+from arch import compute_loss, generate_tokens, load_causal_lm
 from sft import encode_dialogue, evaluate, make_batch
 from tokenizer import TokiPonaTokenizer
 from train import pick_device
@@ -96,7 +97,7 @@ def load_tiny_dialogues(
 
 @torch.no_grad()
 def chat_generate(
-    model: LlamaForCausalLM,
+    model: nn.Module,
     tokenizer: TokiPonaTokenizer,
     history: list[tuple[str, str]],
     device: torch.device,
@@ -110,10 +111,10 @@ def chat_generate(
     ids.extend(tokenizer.encode("ilo:"))
     input_ids = torch.tensor([ids], dtype=torch.long, device=device)
     nl_id = tokenizer.tok2id["\n"]
-    out = model.generate(
+    out = generate_tokens(
+        model=model,
         input_ids=input_ids,
         max_new_tokens=max_new_tokens,
-        do_sample=True,
         temperature=temperature,
         top_p=0.9,
         pad_token_id=tokenizer.pad_token_id,
@@ -141,7 +142,7 @@ def run_arm(
     random.seed(seed)
     torch.manual_seed(seed)
 
-    model = LlamaForCausalLM.from_pretrained(base_dir).to(device)
+    model = load_causal_lm(base_dir, device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.05
     )
@@ -167,8 +168,7 @@ def run_arm(
             idx_pool.extend(more)
         batch = [train_examples[idx_pool.pop()] for _ in range(batch_size)]
         x, y, mask = make_batch(batch, tokenizer.pad_token_id, device)
-        out = model(input_ids=x, attention_mask=mask, labels=y)
-        loss = out.loss
+        loss = compute_loss(model, x, mask, y)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -274,7 +274,7 @@ def main() -> None:
     )
 
     # Baseline (base model before SFT).
-    base_model = LlamaForCausalLM.from_pretrained(args.base).to(device)
+    base_model = load_causal_lm(args.base, device)
     b_red = evaluate(base_model, red_val, args.batch_size, tokenizer.pad_token_id, device)
     b_tiny = evaluate(base_model, tiny_val, args.batch_size, tokenizer.pad_token_id, device)
     del base_model

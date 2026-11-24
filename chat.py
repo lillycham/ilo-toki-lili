@@ -6,8 +6,8 @@ import argparse
 from pathlib import Path
 
 import torch
-from transformers import LlamaForCausalLM
 
+from arch import generate_tokens, get_max_ctx, load_causal_lm
 from tokenizer import TokiPonaTokenizer
 from train import pick_device
 
@@ -23,11 +23,11 @@ def main() -> None:
 
     device = pick_device(args.device)
     tokenizer = TokiPonaTokenizer()
-    model = LlamaForCausalLM.from_pretrained(args.checkpoint).to(device)
+    model = load_causal_lm(args.checkpoint, device)
     model.eval()
 
     nl_id = tokenizer.tok2id["\n"]
-    max_ctx = model.config.max_position_embeddings
+    max_ctx = get_max_ctx(model)
     history: list[tuple[str, str]] = []
 
     print(f"Loaded {args.checkpoint} on {device}. Type Toki Pona (or /reset, /quit).")
@@ -60,10 +60,10 @@ def main() -> None:
 
         input_ids = torch.tensor([ids], dtype=torch.long, device=device)
         with torch.no_grad():
-            out = model.generate(
+            out = generate_tokens(
+                model=model,
                 input_ids=input_ids,
                 max_new_tokens=args.max_new_tokens,
-                do_sample=True,
                 temperature=args.temperature,
                 top_p=args.top_p,
                 pad_token_id=tokenizer.pad_token_id,

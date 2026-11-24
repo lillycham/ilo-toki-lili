@@ -206,11 +206,16 @@ class TokiLlama(nn.Module):
         max_new_tokens: int = 48,
         temperature: float = 0.8,
         top_p: float = 0.9,
-        eos_token_id: int | None = None,
+        eos_token_id: int | list[int] | None = None,
     ) -> torch.Tensor:
         self.eval()
         out = input_ids
         max_ctx = self.cfg.max_position_embeddings
+        eos_ids = (
+            [eos_token_id]
+            if isinstance(eos_token_id, int)
+            else list(eos_token_id) if eos_token_id is not None else []
+        )
         for _ in range(max_new_tokens):
             ctx = out[:, -max_ctx:]
             logits, _ = self(ctx)
@@ -227,7 +232,7 @@ class TokiLlama(nn.Module):
                 sampled = torch.multinomial(sorted_probs, num_samples=1)
                 next_id = sorted_idx.gather(-1, sampled)
             out = torch.cat([out, next_id], dim=-1)
-            if eos_token_id is not None and (next_id == eos_token_id).all():
+            if eos_ids and all(int(tok_id) in eos_ids for tok_id in next_id.view(-1).tolist()):
                 break
         return out
 
@@ -243,3 +248,58 @@ class TokiLlama(nn.Module):
         state = torch.load(out_dir / "model.pt", map_location=map_location, weights_only=True)
         model.load_state_dict(state)
         return model
+
+
+def load_causal_lm(ckpt_dir: Path, device: torch.device) -> nn.Module:
+    """Load either a TokiLlama (toki_config.json) or HF LlamaForCausalLM checkpoint."""
+    if (ckpt_dir / "toki_config.json").exists():
+        return TokiLlama.from_pretrained(ckpt_dir, map_location=device).to(device)
+    from transformers import LlamaForCausalLM
+    return LlamaForCausalLM.from_pretrained(ckpt_dir).to(device)
+
+
+def compute_loss(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    if isinstance(model, TokiLlama):
+        _, loss = model(input_ids=input_ids, labels=labels)
+        assert loss is not None
+        return loss
+    return model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
+
+
+def generate_tokens(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    pad_token_id: int,
+    eos_token_id: int | list[int],
+) -> torch.Tensor:
+    if isinstance(model, TokiLlama):
+        return model.generate(
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+        )
+    return model.generate(
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        do_sample=temperature > 0,
+        temperature=temperature if temperature > 0 else 1.0,
+        top_p=top_p,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+    )
+
+
+def get_max_ctx(model: nn.Module) -> int:
+    if isinstance(model, TokiLlama):
+        return model.cfg.max_position_embeddings
+    return int(model.config.max_position_embeddings)
